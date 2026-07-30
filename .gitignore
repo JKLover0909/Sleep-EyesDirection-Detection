@@ -5,6 +5,8 @@ __pycache__/
 node_modules/
 data/snapshots/*.jpg
 data/events.db
+data/server.log
+data/server.pid
 *.pt
 .DS_Store
 .env

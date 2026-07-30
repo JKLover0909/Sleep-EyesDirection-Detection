@@ -17,6 +17,7 @@ import os
 import threading
 import time
 from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -35,6 +36,23 @@ VIDEOS_DIR = os.path.join(BASE_DIR, "data", "sample_videos")
 SNAPSHOTS_DIR = os.path.join(BASE_DIR, "data", "snapshots")
 MODEL_PATH = os.path.join(BASE_DIR, "models", "face_landmarker.task")
 os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+
+
+def _is_jetson() -> bool:
+    flag = os.environ.get("JETSON", "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if flag in ("0", "false", "no", "off"):
+        return False
+    return os.path.exists("/etc/nv_tegra_release")
+
+
+IS_JETSON = _is_jetson()
+# Face Mesh đủ tốt ở 640 trên Jetson; desktop giữ 960
+MAX_FRAME_W = int(os.environ.get("SLEEP_MAX_W", "640" if IS_JETSON else "960"))
+FRAME_SKIP = int(os.environ.get("SLEEP_FRAME_SKIP", "2" if IS_JETSON else "1"))
+JPEG_QUALITY = int(os.environ.get("SLEEP_JPEG_QUALITY", "60" if IS_JETSON else "75"))
+_alert_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fqc-alert")
 
 LEFT_EYE = [33, 133, 160, 144, 158, 153]
 RIGHT_EYE = [362, 263, 385, 380, 387, 373]
@@ -181,14 +199,34 @@ def _build_landmarker() -> vision.FaceLandmarker:
         raise FileNotFoundError(
             f"Missing model: {MODEL_PATH}. Download face_landmarker.task into models/."
         )
+    base_kwargs = {"model_asset_path": MODEL_PATH}
+    # Thử GPU delegate trên Jetson (fallback CPU nếu không hỗ trợ)
+    if IS_JETSON:
+        try:
+            base_kwargs["delegate"] = mp_python.BaseOptions.Delegate.GPU
+        except Exception:
+            pass
     options = vision.FaceLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+        base_options=mp_python.BaseOptions(**base_kwargs),
         running_mode=vision.RunningMode.VIDEO,
         num_faces=1,
         output_face_blendshapes=False,
         output_facial_transformation_matrixes=False,
     )
-    return vision.FaceLandmarker.create_from_options(options)
+    try:
+        return vision.FaceLandmarker.create_from_options(options)
+    except Exception:
+        if "delegate" in base_kwargs:
+            base_kwargs.pop("delegate", None)
+            options = vision.FaceLandmarkerOptions(
+                base_options=mp_python.BaseOptions(**base_kwargs),
+                running_mode=vision.RunningMode.VIDEO,
+                num_faces=1,
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+            )
+            return vision.FaceLandmarker.create_from_options(options)
+        raise
 
 
 class FQCProcessor:
@@ -304,8 +342,10 @@ class FQCProcessor:
             self.cap.release()
         src = self.source if self.source is not None else 0
         self.cap = cv2.VideoCapture(src)
-        if isinstance(src, str):
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
         self._video_ts_ms = 0
 
     def _smooth_gaze(self, direction: str) -> str:
@@ -320,13 +360,18 @@ class FQCProcessor:
         stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
         fname = f"{event_type}_{stamp}.jpg"
         path = os.path.join(SNAPSHOTS_DIR, fname)
-        cv2.imwrite(path, frame)
-        rel = f"/snapshots/{fname}"
-        db = SessionLocal()
-        try:
-            create_event(db, event_type, message, severity=severity, snapshot_path=rel)
-        finally:
-            db.close()
+        snap = frame.copy()
+
+        def _write():
+            cv2.imwrite(path, snap)
+            rel = f"/snapshots/{fname}"
+            db = SessionLocal()
+            try:
+                create_event(db, event_type, message, severity=severity, snapshot_path=rel)
+            finally:
+                db.close()
+
+        _alert_executor.submit(_write)
 
     def _draw(self, frame, landmarks_np: np.ndarray, metrics: FrameMetrics):
         h, w = frame.shape[:2]
@@ -423,10 +468,16 @@ class FQCProcessor:
                 time.sleep(0.05)
                 continue
 
+            # Jetson: bỏ qua frame xen kẽ để giảm tải CPU MediaPipe
+            self._loop_i = getattr(self, "_loop_i", 0) + 1
+            if FRAME_SKIP > 1 and (self._loop_i % FRAME_SKIP) != 0:
+                self._video_ts_ms += 33 * FRAME_SKIP
+                continue
+
             h0, w0 = frame.shape[:2]
-            if w0 > 960:
-                scale = 960 / w0
-                frame = cv2.resize(frame, (960, int(h0 * scale)))
+            if w0 > MAX_FRAME_W:
+                scale = MAX_FRAME_W / w0
+                frame = cv2.resize(frame, (MAX_FRAME_W, int(h0 * scale)))
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -516,14 +567,15 @@ class FQCProcessor:
                     2,
                 )
 
-            ok_enc, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+            ok_enc, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
             if ok_enc:
                 with self.lock:
                     self.jpeg = buf.tobytes()
                     self.frame_version += 1
                     self.metrics = metrics
 
-            if isinstance(self.source, str):
+            # Chỉ sleep nhẹ trên desktop khi chạy video file; Jetson bỏ để theo kịp decode
+            if isinstance(self.source, str) and not IS_JETSON:
                 time.sleep(0.03)
 
         if self.cap:

@@ -1,0 +1,22 @@
+[Unit]
+Description=FQC Sleep & Eye Direction Detection Demo
+After=network.target
+
+[Service]
+Type=simple
+User=jkl
+Group=jkl
+WorkingDirectory=/home/jkl/Code/Sleep-EyesDirection-Detection/backend
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/jkl/Code/Sleep-EyesDirection-Detection/.venv/bin/python /home/jkl/Code/Sleep-EyesDirection-Detection/backend/main.py
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+
+# Keep running after SSH/Cursor disconnect
+StandardOutput=append:/home/jkl/Code/Sleep-EyesDirection-Detection/data/server.log
+StandardError=append:/home/jkl/Code/Sleep-EyesDirection-Detection/data/server.log
+
+[Install]
+WantedBy=multi-user.target

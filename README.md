@@ -47,7 +47,7 @@ references/      # Ghi chú nguồn
 third_party/     # LICENSE tham chiếu
 ```
 
-## Chạy demo
+## Chạy demo (tạm trong terminal)
 
 ```bash
 cd /home/jkl/Code/Sleep-EyesDirection-Detection
@@ -58,7 +58,21 @@ cd backend
 python main.py
 ```
 
-Mở dashboard: **http://localhost:8010**
+## Chạy nền (tắt Cursor/SSH vẫn live)
+
+```bash
+# start (tmux + auto-restart nếu crash)
+./scripts/start_detached.sh
+
+# kiểm tra
+./scripts/status.sh
+
+# dừng
+./scripts/stop.sh
+```
+
+Session tmux: `fqc-sleep-eyes` · log: `data/server.log`  
+Dashboard: **http://\<server-ip\>:8010** (vd. `http://172.100.0.6:8010`)
 
 - Chọn video mẫu `driver_demo.mp4` hoặc **Webcam**
 - Overlay: landmarks / gaze arrow / HUD
